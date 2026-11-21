@@ -101,6 +101,64 @@ export function boxOnDeadSquare(board: Board): boolean {
   return board.boxes.some((box) => live[box] === 0);
 }
 
+/** One room: its boxes, its goals, and its lowest square (scan order). */
+export interface Room {
+  boxes: number[];
+  goals: number[];
+  first: number;
+}
+
+/** Split a board into rooms: cut the dead squares of the player's row
+ *  (the hallway) out of the floor; each remaining connected part holding
+ *  boxes is a room. Null when the level is not a set of rooms: a box
+ *  starts in the hallway, a goal falls in a cut square, or some part
+ *  holds unequal boxes and goals (or goals with no boxes). */
+export function splitRooms(board: Board): Room[] | null {
+  if (board.player < 0) return null;
+  const live = liveSquares(board);
+  const playerRow = Math.floor(board.player / board.width);
+  const cut = new Set<number>();
+  for (let x = 0; x < board.width; x++) {
+    const sq = playerRow * board.width + x;
+    if (board.wall[sq] === 0 && live[sq] === 0) cut.add(sq);
+  }
+  if (board.boxes.some((box) => Math.floor(box / board.width) === playerRow)) return null;
+  for (let sq = 0; sq < board.width * board.height; sq++) {
+    if (board.goal[sq] === 1 && cut.has(sq)) return null;
+  }
+  const seen = new Set<number>();
+  const rooms: Room[] = [];
+  for (let start = 0; start < board.width * board.height; start++) {
+    if (board.wall[start] === 1 || cut.has(start) || seen.has(start)) continue;
+    const comp: number[] = [];
+    const queue = [start];
+    seen.add(start);
+    for (let head = 0; head < queue.length; head++) {
+      const cur = queue[head];
+      comp.push(cur);
+      const cx = cur % board.width;
+      const cy = Math.floor(cur / board.width);
+      for (const dir of DIRS) {
+        const nx = cx + dir.dx;
+        const ny = cy + dir.dy;
+        if (nx < 0 || nx >= board.width || ny < 0 || ny >= board.height) continue;
+        const next = ny * board.width + nx;
+        if (board.wall[next] === 1 || cut.has(next) || seen.has(next)) continue;
+        seen.add(next);
+        queue.push(next);
+      }
+    }
+    const boxes = comp.filter((sq) => board.boxes.includes(sq)).sort((a, b) => a - b);
+    const goals = comp.filter((sq) => board.goal[sq] === 1);
+    if (boxes.length === 0 && goals.length === 0) continue;
+    if (boxes.length !== goals.length) return null;
+    rooms.push({ boxes, goals, first: comp[0] });
+  }
+  if (rooms.length === 0) return null;
+  rooms.sort((a, b) => a.first - b.first);
+  return rooms;
+}
+
 /** All floor squares the player can walk to from `from`, avoiding walls
  *  and the given boxes. */
 export function floodFill(board: Board, boxes: readonly number[], from: number): Set<number> {
@@ -179,6 +237,26 @@ export function shortestWalk(
 /** Work budget per push search, in states — work, never the clock. */
 const SEARCH_BUDGET = 250_000;
 
+/** Work budget for a whole set of levels (5 searches of SEARCH_BUDGET). */
+const SET_BUDGET = SEARCH_BUDGET * 5;
+
+/** Below this much remaining set budget, a level is not attempted: not
+ *  even a small room search can be trusted to finish, and an empty
+ *  solution beats burning the rest of the run's time. */
+const SET_MIN_REMAINING = 10_000;
+
+/** Shared work budget for a set of levels: states spent so far, and the
+ *  cap for the whole set. */
+export interface WorkBudget {
+  spent: number;
+  limit: number;
+}
+
+/** A fresh set budget. */
+export function createSetBudget(limit: number = SET_BUDGET): WorkBudget {
+  return { spent: 0, limit };
+}
+
 /** Plain direction offsets for the hot flood fill (up, down, left, right). */
 const FILL_DX: readonly number[] = [0, 0, -1, 1];
 const FILL_DY: readonly number[] = [-1, 1, 0, 0];
@@ -191,6 +269,7 @@ interface SearchNode {
   parent: number;
   pushSquare: number;
   pushCh: string;
+  depth: number;
 }
 
 /** Reusable scratch for flood fills: `seen` holds a stamp per square so a
@@ -305,16 +384,29 @@ function reconstruct(
   return moves + walk + lastPushCh.toUpperCase();
 }
 
-/** The moves for a level in XSB: a string of u, d, l and r (an upper letter marks a push; case is not checked).
- *  Push-optimal BFS: a state is the sorted box squares plus the canonical
- *  player region (lowest reachable square); states expand in push order,
- *  so the first solved state found is push-optimal. Returns '' when the
- *  level is already solved, has no solution, or the state budget runs out. */
-export function solve(level: string): string {
-  const board = parseBoard(level);
-  if (board.player < 0 || board.boxes.length === 0) return '';
-  if (board.boxes.every((box) => board.goal[box] === 1)) return '';
-  if (boxOnDeadSquare(board)) return '';
+/** Outcome of one push search: the moves, how many of them are pushes,
+ *  where the player ends up, and how many states the search created. */
+interface SearchOutcome {
+  moves: string;
+  pushes: number;
+  endPlayer: number;
+  states: number;
+}
+
+/** Push-optimal BFS over one board: a state is the sorted box squares
+ *  plus the canonical player region (lowest reachable square); states
+ *  expand in push order, so the first solved state found is push-optimal.
+ *  The search draws on the shared work budget and charges every state it
+ *  creates to it. Null when the board has no solution or the state
+ *  budget runs out. An already-solved board returns an empty outcome. */
+function searchPushes(board: Board, player: number, budget: WorkBudget): SearchOutcome | null {
+  if (player < 0 || board.boxes.length === 0) {
+    return { moves: '', pushes: 0, endPlayer: player, states: 0 };
+  }
+  if (board.boxes.every((box) => board.goal[box] === 1)) {
+    return { moves: '', pushes: 0, endPlayer: player, states: 0 };
+  }
+  if (boxOnDeadSquare(board)) return null;
   const live = liveSquares(board);
   const size = board.width * board.height;
   // Two scratches: the dequeued state's region stays live in `regionScratch`
@@ -322,13 +414,17 @@ export function solve(level: string): string {
   const regionScratch = makeRegionScratch(size);
   const candidateScratch = makeRegionScratch(size);
   const nodes: SearchNode[] = [
-    { boxes: [...board.boxes], player: board.player, parent: -1, pushSquare: -1, pushCh: '' },
+    { boxes: [...board.boxes], player, parent: -1, pushSquare: -1, pushCh: '', depth: 0 },
   ];
   const keyOf = (boxes: readonly number[], region: number): string =>
     `${boxes.join(',')}|${region}`;
-  const startRegion = fillRegion(board, board.boxes, board.player, regionScratch);
+  const startRegion = fillRegion(board, board.boxes, player, regionScratch);
   const seen = new Map<string, number>();
   seen.set(keyOf(board.boxes, startRegion.lowest), 0);
+  // This search may use at most one per-search budget, and never more
+  // than the shared budget has left.
+  const cap = Math.min(SEARCH_BUDGET, budget.limit - budget.spent);
+  if (cap <= 0) return null;
   for (let head = 0; head < nodes.length; head++) {
     const node = nodes[head];
     const region = fillRegion(board, node.boxes, node.player, regionScratch);
@@ -350,12 +446,18 @@ export function solve(level: string): string {
         nextBoxes.splice(at, 0, dest);
         if (isFrozenBlock(board, nextBoxes, dest)) continue;
         if (nextBoxes.every((b) => board.goal[b] === 1)) {
-          return reconstruct(board, nodes, head, pushSq, dir.ch);
+          const moves = reconstruct(board, nodes, head, pushSq, dir.ch);
+          budget.spent += nodes.length;
+          if (moves === '') return null;
+          return { moves, pushes: nodes[head].depth + 1, endPlayer: box, states: nodes.length };
         }
         const nextRegion = fillRegion(board, nextBoxes, box, candidateScratch);
         const key = keyOf(nextBoxes, nextRegion.lowest);
         if (seen.has(key)) continue;
-        if (nodes.length >= SEARCH_BUDGET) return '';
+        if (nodes.length >= cap) {
+          budget.spent += nodes.length;
+          return null;
+        }
         seen.set(key, nodes.length);
         nodes.push({
           boxes: nextBoxes,
@@ -363,11 +465,74 @@ export function solve(level: string): string {
           parent: head,
           pushSquare: pushSq,
           pushCh: dir.ch.toUpperCase(),
+          depth: nodes[head].depth + 1,
         });
       }
     }
   }
-  return '';
+  budget.spent += nodes.length;
+  return null;
+}
+
+/** Solve a level room by room, in scan order. Other rooms' boxes act as
+ *  walls (on their goals once solved — they never move, so a wall is all
+ *  they ever are to this room). The player carries on from where the last
+ *  room left them; push counts add up. Null when any room fails: the
+ *  caller falls back to the whole-level search. */
+function solveRooms(board: Board, rooms: readonly Room[], budget: WorkBudget): string | null {
+  let moves = '';
+  let player = board.player;
+  // Where every room's boxes stand right now: their starting squares
+  // until the room is solved, their goals afterwards. A later room's
+  // search must see the solved boxes where they actually are — on their
+  // goals — or it will plan walks through occupied squares.
+  const placed: number[][] = rooms.map((room) => [...room.boxes]);
+  for (let ri = 0; ri < rooms.length; ri++) {
+    const room = rooms[ri];
+    const otherBoxes: number[] = [];
+    for (let oj = 0; oj < rooms.length; oj++) {
+      if (oj !== ri) otherBoxes.push(...placed[oj]);
+    }
+    const wall = new Uint8Array(board.wall);
+    for (const box of otherBoxes) wall[box] = 1;
+    const goal = new Uint8Array(board.width * board.height);
+    for (const sq of room.goals) goal[sq] = 1;
+    const sub: Board = {
+      width: board.width,
+      height: board.height,
+      wall,
+      goal,
+      boxes: [...room.boxes],
+      player,
+    };
+    const result = searchPushes(sub, player, budget);
+    if (result === null) return null;
+    moves += result.moves;
+    player = result.endPlayer;
+    placed[ri] = [...room.goals].sort((a, b) => a - b);
+  }
+  return moves;
+}
+
+/** The moves for a level in XSB: a string of u, d, l and r (an upper letter marks a push; case is not checked).
+ *  Room by room when the level splits into rooms, whole-level otherwise;
+ *  a failed room search falls back to the whole-level search. Returns ''
+ *  when the level is already solved, has no solution, or the work budget
+ *  runs out. The optional budget is shared across a set of levels; a
+ *  fresh one is created for a single level. */
+export function solve(level: string, budget: WorkBudget = createSetBudget()): string {
+  const board = parseBoard(level);
+  if (board.player < 0 || board.boxes.length === 0) return '';
+  if (board.boxes.every((box) => board.goal[box] === 1)) return '';
+  if (boxOnDeadSquare(board)) return '';
+  if (budget.limit - budget.spent <= 0) return '';
+  const rooms = splitRooms(board);
+  if (rooms !== null) {
+    const roomMoves = solveRooms(board, rooms, budget);
+    if (roomMoves !== null) return roomMoves;
+  }
+  const whole = searchPushes(board, board.player, budget);
+  return whole === null ? '' : whole.moves;
 }
 
 function run(inputDir: string, outputDir: string): void {
@@ -375,9 +540,14 @@ function run(inputDir: string, outputDir: string): void {
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .sort();
+  // One work budget for the whole set: a timeout zeroes the run, so once
+  // the budget is nearly spent, stop searching and write empty solutions
+  // for the remaining levels instead of risking the run.
+  const budget = createSetBudget();
   for (const id of ids) {
     const level = readFileSync(join(inputDir, id, 'level.txt'), 'utf8');
-    const moves = solve(level);
+    const moves =
+      budget.limit - budget.spent < SET_MIN_REMAINING ? '' : solve(level, budget);
     mkdirSync(join(outputDir, id), { recursive: true });
     writeFileSync(join(outputDir, id, 'solution.txt'), `${moves}\n`);
   }
