@@ -111,8 +111,10 @@ export interface Room {
 /** Split a board into rooms: cut the dead squares of the player's row
  *  (the hallway) out of the floor; each remaining connected part holding
  *  boxes is a room. Null when the level is not a set of rooms: a box
- *  starts in the hallway, a goal falls in a cut square, or some part
- *  holds unequal boxes and goals (or goals with no boxes). */
+ *  starts on a cut square in the hallway, a goal falls in a cut square,
+ *  or some part holds unequal boxes and goals (or goals with no boxes).
+ *  A box on a live square in the player's row is fine — it can still
+ *  reach a goal, so the level can still be a set of rooms. */
 export function splitRooms(board: Board): Room[] | null {
   if (board.player < 0) return null;
   const live = liveSquares(board);
@@ -122,7 +124,7 @@ export function splitRooms(board: Board): Room[] | null {
     const sq = playerRow * board.width + x;
     if (board.wall[sq] === 0 && live[sq] === 0) cut.add(sq);
   }
-  if (board.boxes.some((box) => Math.floor(box / board.width) === playerRow)) return null;
+  if (board.boxes.some((box) => cut.has(box))) return null;
   for (let sq = 0; sq < board.width * board.height; sq++) {
     if (board.goal[sq] === 1 && cut.has(sq)) return null;
   }
@@ -345,7 +347,13 @@ function isFrozenBlock(board: Board, boxes: readonly number[], dest: number): bo
     let hasOffGoalBox = false;
     for (let dy = 0; dy < 2; dy++) {
       for (let dx = 0; dx < 2; dx++) {
-        const sq = (tly + dy) * w + (tlx + dx);
+        const sx = tlx + dx;
+        const sy = tly + dy;
+        // Out-of-board squares count as walls — and must not wrap around
+        // to the other side of the board, where a real square could hold
+        // a box and falsely mark this block frozen.
+        if (sx < 0 || sx >= w || sy < 0 || sy >= board.height) continue;
+        const sq = sy * w + sx;
         const isBox = boxes.includes(sq);
         if (!isBox && isOpen(board, sq)) allBlocked = false;
         if (isBox && board.goal[sq] === 0) hasOffGoalBox = true;
@@ -519,37 +527,64 @@ function solveRooms(board: Board, rooms: readonly Room[], budget: WorkBudget): s
  *  a failed room search falls back to the whole-level search. Returns ''
  *  when the level is already solved, has no solution, or the work budget
  *  runs out. The optional budget is shared across a set of levels; a
- *  fresh one is created for a single level. */
+ *  fresh one is created for a single level. One level may charge at most
+ *  two per-search budgets to the shared budget — one for the room phase,
+ *  one for the whole-level fallback — so a single pathological level can
+ *  never starve the other levels in the set. */
 export function solve(level: string, budget: WorkBudget = createSetBudget()): string {
   const board = parseBoard(level);
   if (board.player < 0 || board.boxes.length === 0) return '';
   if (board.boxes.every((box) => board.goal[box] === 1)) return '';
   if (boxOnDeadSquare(board)) return '';
   if (budget.limit - budget.spent <= 0) return '';
+  const levelBudget: WorkBudget = {
+    spent: budget.spent,
+    limit: Math.min(budget.limit, budget.spent + 2 * SEARCH_BUDGET),
+  };
   const rooms = splitRooms(board);
   if (rooms !== null) {
-    const roomMoves = solveRooms(board, rooms, budget);
-    if (roomMoves !== null) return roomMoves;
+    const roomMoves = solveRooms(board, rooms, levelBudget);
+    if (roomMoves !== null) {
+      budget.spent = levelBudget.spent;
+      return roomMoves;
+    }
   }
-  const whole = searchPushes(board, board.player, budget);
+  const whole = searchPushes(board, board.player, levelBudget);
+  budget.spent = levelBudget.spent;
   return whole === null ? '' : whole.moves;
 }
 
 function run(inputDir: string, outputDir: string): void {
-  const ids = readdirSync(inputDir, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .sort();
+  let ids: string[];
+  try {
+    ids = readdirSync(inputDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort();
+  } catch {
+    return;
+  }
   // One work budget for the whole set: a timeout zeroes the run, so once
   // the budget is nearly spent, stop searching and write empty solutions
   // for the remaining levels instead of risking the run.
   const budget = createSetBudget();
   for (const id of ids) {
-    const level = readFileSync(join(inputDir, id, 'level.txt'), 'utf8');
-    const moves =
-      budget.limit - budget.spent < SET_MIN_REMAINING ? '' : solve(level, budget);
-    mkdirSync(join(outputDir, id), { recursive: true });
-    writeFileSync(join(outputDir, id, 'solution.txt'), `${moves}\n`);
+    // One bad instance must never kill the rest of the set: a missing or
+    // unreadable level still gets an empty (valid, 0-point) solution.
+    let moves = '';
+    try {
+      const level = readFileSync(join(inputDir, id, 'level.txt'), 'utf8');
+      moves =
+        budget.limit - budget.spent < SET_MIN_REMAINING ? '' : solve(level, budget);
+    } catch {
+      moves = '';
+    }
+    try {
+      mkdirSync(join(outputDir, id), { recursive: true });
+      writeFileSync(join(outputDir, id, 'solution.txt'), `${moves}\n`);
+    } catch {
+      // Nowhere to write this instance's solution; continue with the rest.
+    }
   }
 }
 
