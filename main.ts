@@ -176,8 +176,197 @@ export function shortestWalk(
   return null;
 }
 
-/** The moves for a level in XSB: a string of u, d, l and r (an upper letter marks a push; case is not checked). */
-export function solve(_level: string): string {
+/** Work budget per push search, in states — work, never the clock. */
+const SEARCH_BUDGET = 250_000;
+
+/** Plain direction offsets for the hot flood fill (up, down, left, right). */
+const FILL_DX: readonly number[] = [0, 0, -1, 1];
+const FILL_DY: readonly number[] = [-1, 1, 0, 0];
+
+/** One BFS node: the boxes after this node's push, where the player stands
+ *  (the pushed box's old square), and how to get here from the parent. */
+interface SearchNode {
+  boxes: number[];
+  player: number;
+  parent: number;
+  pushSquare: number;
+  pushCh: string;
+}
+
+/** Reusable scratch for flood fills: `seen` holds a stamp per square so a
+ *  fill never allocates or clears an array, `blocked` marks the boxes,
+ *  `queue` is the BFS work list. Two scratches are used by the search: one
+ *  holds the dequeued state's region while the other fills candidates. */
+interface RegionScratch {
+  seen: Uint32Array;
+  blocked: Uint8Array;
+  queue: Int32Array;
+  stamp: number;
+}
+
+function makeRegionScratch(size: number): RegionScratch {
+  return { seen: new Uint32Array(size), blocked: new Uint8Array(size), queue: new Int32Array(size), stamp: 0 };
+}
+
+/** Flood fill over open floor avoiding walls and boxes, into `scratch`.
+ *  Returns the lowest square reached (the canonical name of the region)
+ *  and the stamp marking this fill's squares in `scratch.seen` — a square
+ *  `sq` is in the region exactly when `scratch.seen[sq] === stamp`. The
+ *  stamp stays valid until the same scratch is filled again. */
+function fillRegion(
+  board: Board,
+  boxes: readonly number[],
+  from: number,
+  scratch: RegionScratch,
+): { lowest: number; stamp: number } {
+  const stamp = ++scratch.stamp;
+  const { seen, blocked, queue } = scratch;
+  const w = board.width;
+  const h = board.height;
+  const wall = board.wall;
+  for (const box of boxes) blocked[box] = 1;
+  let lowest = -1;
+  if (isOpen(board, from) && !blocked[from]) {
+    let head = 0;
+    let tail = 0;
+    queue[tail++] = from;
+    seen[from] = stamp;
+    lowest = from;
+    while (head < tail) {
+      const cur = queue[head++];
+      const cx = cur % w;
+      const cy = Math.floor(cur / w);
+      for (let d = 0; d < 4; d++) {
+        const nx = cx + FILL_DX[d];
+        const ny = cy + FILL_DY[d];
+        if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+        const next = ny * w + nx;
+        if (seen[next] === stamp || blocked[next] || wall[next]) continue;
+        seen[next] = stamp;
+        if (next < lowest) lowest = next;
+        queue[tail++] = next;
+      }
+    }
+  }
+  for (const box of boxes) blocked[box] = 0;
+  return { lowest, stamp };
+}
+
+/** True when `dest` sits in a frozen 2x2 block: all four squares are
+ *  walls or boxes, and at least one box in the block is off its goal.
+ *  Out-of-board squares count as walls. */
+function isFrozenBlock(board: Board, boxes: readonly number[], dest: number): boolean {
+  const w = board.width;
+  const x = dest % w;
+  const y = Math.floor(dest / w);
+  for (const [ox, oy] of [[0, 0], [-1, 0], [0, -1], [-1, -1]] as const) {
+    const tlx = x + ox;
+    const tly = y + oy;
+    let allBlocked = true;
+    let hasOffGoalBox = false;
+    for (let dy = 0; dy < 2; dy++) {
+      for (let dx = 0; dx < 2; dx++) {
+        const sq = (tly + dy) * w + (tlx + dx);
+        const isBox = boxes.includes(sq);
+        if (!isBox && isOpen(board, sq)) allBlocked = false;
+        if (isBox && board.goal[sq] === 0) hasOffGoalBox = true;
+      }
+    }
+    if (allBlocked && hasOffGoalBox) return true;
+  }
+  return false;
+}
+
+/** Rebuild the moves for a solution whose last push starts from
+ *  `parentIdx` at `lastPushSq` in direction `lastPushCh`: walk the chain
+ *  of parent pointers back to the root, then walk each push's approach
+ *  with the shortest walk and append the push (upper-case letter). */
+function reconstruct(
+  board: Board,
+  nodes: readonly SearchNode[],
+  parentIdx: number,
+  lastPushSq: number,
+  lastPushCh: string,
+): string {
+  const chain: number[] = [];
+  for (let i = parentIdx; i > 0; i = nodes[i].parent) chain.push(i);
+  chain.reverse();
+  let moves = '';
+  for (const idx of chain) {
+    const node = nodes[idx];
+    const parent = nodes[node.parent];
+    const walk = shortestWalk(board, parent.boxes, parent.player, node.pushSquare);
+    if (walk === null) return '';
+    moves += walk + node.pushCh;
+  }
+  const lastParent = nodes[parentIdx];
+  const walk = shortestWalk(board, lastParent.boxes, lastParent.player, lastPushSq);
+  if (walk === null) return '';
+  return moves + walk + lastPushCh.toUpperCase();
+}
+
+/** The moves for a level in XSB: a string of u, d, l and r (an upper letter marks a push; case is not checked).
+ *  Push-optimal BFS: a state is the sorted box squares plus the canonical
+ *  player region (lowest reachable square); states expand in push order,
+ *  so the first solved state found is push-optimal. Returns '' when the
+ *  level is already solved, has no solution, or the state budget runs out. */
+export function solve(level: string): string {
+  const board = parseBoard(level);
+  if (board.player < 0 || board.boxes.length === 0) return '';
+  if (board.boxes.every((box) => board.goal[box] === 1)) return '';
+  if (boxOnDeadSquare(board)) return '';
+  const live = liveSquares(board);
+  const size = board.width * board.height;
+  // Two scratches: the dequeued state's region stays live in `regionScratch`
+  // while candidate regions are filled into `candidateScratch`.
+  const regionScratch = makeRegionScratch(size);
+  const candidateScratch = makeRegionScratch(size);
+  const nodes: SearchNode[] = [
+    { boxes: [...board.boxes], player: board.player, parent: -1, pushSquare: -1, pushCh: '' },
+  ];
+  const keyOf = (boxes: readonly number[], region: number): string =>
+    `${boxes.join(',')}|${region}`;
+  const startRegion = fillRegion(board, board.boxes, board.player, regionScratch);
+  const seen = new Map<string, number>();
+  seen.set(keyOf(board.boxes, startRegion.lowest), 0);
+  for (let head = 0; head < nodes.length; head++) {
+    const node = nodes[head];
+    const region = fillRegion(board, node.boxes, node.player, regionScratch);
+    for (let bi = 0; bi < node.boxes.length; bi++) {
+      const box = node.boxes[bi];
+      const bx = box % board.width;
+      const by = Math.floor(box / board.width);
+      for (const dir of DIRS) {
+        const dest = (by + dir.dy) * board.width + (bx + dir.dx);
+        if (!isOpen(board, dest) || node.boxes.includes(dest)) continue;
+        if (live[dest] === 0) continue;
+        const pushSq = (by - dir.dy) * board.width + (bx - dir.dx);
+        if (regionScratch.seen[pushSq] !== region.stamp) continue;
+        // Move the box, keeping the list sorted (remove, then insert).
+        const nextBoxes = [...node.boxes];
+        nextBoxes.splice(bi, 1);
+        let at = 0;
+        while (at < nextBoxes.length && nextBoxes[at] < dest) at++;
+        nextBoxes.splice(at, 0, dest);
+        if (isFrozenBlock(board, nextBoxes, dest)) continue;
+        if (nextBoxes.every((b) => board.goal[b] === 1)) {
+          return reconstruct(board, nodes, head, pushSq, dir.ch);
+        }
+        const nextRegion = fillRegion(board, nextBoxes, box, candidateScratch);
+        const key = keyOf(nextBoxes, nextRegion.lowest);
+        if (seen.has(key)) continue;
+        if (nodes.length >= SEARCH_BUDGET) return '';
+        seen.set(key, nodes.length);
+        nodes.push({
+          boxes: nextBoxes,
+          player: box,
+          parent: head,
+          pushSquare: pushSq,
+          pushCh: dir.ch.toUpperCase(),
+        });
+      }
+    }
+  }
   return '';
 }
 
